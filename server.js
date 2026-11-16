@@ -11,6 +11,8 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const https = require("https");
+const { spawn } = require("child_process");
+const path = require("path");
 
 const KEY = process.env.BRIDGE_KEY;
 const ALLOWED = (process.env.ALLOWED_TARGETS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -24,7 +26,37 @@ app.use(express.json({ limit: "100kb" }));
 app.use(cors({ origin: process.env.ALLOW_ORIGIN || "*", allowedHeaders: ["Content-Type", "X-Bridge-Key"] }));
 
 const tokens = new Map(); // session tokens, one per router and username
-const ACTIONS = ["login", "status", "block", "unblock", "wifi"];
+const ACTIONS = ["login", "status", "block", "unblock", "wifi", "clients"];
+
+// ---- TP-Link Archer C80 (and other tplinkrouterc6u-supported routers) ----
+// The C80's web API uses a proprietary RSA/AES handshake that the generic
+// template engine below can't speak. Instead we shell out to a small Python
+// helper that uses the maintained `tplinkrouterc6u` library, which already
+// implements and tests that handshake. Requires on the host:
+//   pip install tplinkrouterc6u --break-system-packages
+function runTplinkBridge(action, router, extra) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({
+      action,
+      host: router.host,
+      port: router.port,
+      https: !!router.https,
+      username: router.adminUser || "admin",
+      password: router.password || process.env.ROUTER_PASSWORD || "",
+      ...extra,
+    });
+    const script = path.join(__dirname, "tplink_bridge.py");
+    const proc = spawn("python3", [script, payload]);
+    let out = "", err = "";
+    proc.stdout.on("data", d => out += d);
+    proc.stderr.on("data", d => err += d);
+    proc.on("error", e => reject(new Error("Could not start python3: " + e.message)));
+    proc.on("close", () => {
+      try { resolve(JSON.parse(out.trim().split("\n").pop())); }
+      catch (e) { reject(new Error("Bad response from tplink_bridge.py: " + (err || out || e.message))); }
+    });
+  });
+}
 
 // {{name}} placeholders: JSON-escaped in JSON bodies, URL-encoded in paths and form bodies
 function fill(str, vars, mode) {
@@ -100,6 +132,12 @@ app.post("/api/run", async (req, res) => {
     if (!ACTIONS.includes(action)) return res.status(400).json({ error: "Unknown action" });
     if (!router.host || !router.port) return res.status(400).json({ error: "Router IP and port are required" });
     if (!ALLOWED.includes(`${router.host}:${router.port}`)) return res.status(403).json({ error: "That router isn't in ALLOWED_TARGETS" });
+
+    if (router.type === "archer_c80") {
+      // Archer C80 bypasses the generic JSON-template engine; see runTplinkBridge above.
+      const result = await runTplinkBridge(action, router, { mac: vars.mac });
+      return res.status(result.ok ? 200 : 502).json(result);
+    }
     res.json(await run(action, router, templates, vars));
   } catch (e) {
     res.status(502).json({ error: e.message });
